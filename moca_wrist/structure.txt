@@ -1,0 +1,34 @@
+- train
+    - 80Hz_RAW
+        - 1.5to5.9
+            - subject_id.csv.gz
+        - 6to9.9
+        ...
+    - Event_file
+        - age_group
+            - subject_id.csv
+- test
+- support files
+    - age_group
+        - MOCA_concurrentWear.csv  
+        - MOCA_unknownEvent.csv
+    - other age_group
+    ...
+
+Event file header: "Time","DataCount (samples)","Interval (s)","ActivityCode (0=sedentary, 1= standing, 2=stepping)","CumulativeStepCount","Activity Score (MET.h)","Abs(sumDiff)"
+time是这种格式："43789.6450231482"
+
+raw 的header在第11行，然后从12行开始是xyz的三轴数据，这个应该和原来的input是类似的
+
+剩下就是用MOCA_unknownEvent.csv，不用MOCA_concurrentWear.csv，unknow的header格式之前有给过你
+
+------------ Data File Created By ActiGraph GT3X+ ActiLife v6.13.4 Firmware v3.2.1 date format M/d/yyyy at 80 Hz  Filter Normal -----------
+Serial Number:
+Start Time 15:55:05
+Start Date 05/30/2019
+Epoch Period (hh:mm:ss) 00:00:00
+Download Time 
+Download Date 
+Current Memory Address: 0
+Current Battery Voltage: 3.86     Mode = 12
+--------------------------------------------------
