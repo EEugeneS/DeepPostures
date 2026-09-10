@@ -75,7 +75,7 @@ def iter_valid_sequences(segment_path: Path) -> Iterator[tuple[np.ndarray, np.nd
 
 def iter_segment_windows(
     subject_dir: Path, subject: str, window_size: int
-) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, str, str]]:
+) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, str, str, str]]:
     """Yield non-overlapping CHAP windows, resetting at every segment H5."""
     segment_paths = sorted(path for path in subject_dir.glob("*.h5") if path.is_file())
     if not segment_paths:
@@ -85,6 +85,7 @@ def iter_segment_windows(
     for segment_path in segment_paths:
         with h5py.File(segment_path, "r") as h5_file:
             environment = _as_text(h5_file.attrs.get("environment", "unknown"))
+            age_group = _as_text(h5_file.attrs.get("age_group", "unknown"))
         for x_sequence, timestamps, y_sequence in iter_valid_sequences(segment_path):
             complete_windows = len(y_sequence) // window_size
             for window_index in range(complete_windows):
@@ -96,6 +97,7 @@ def iter_segment_windows(
                     y_sequence[start:end],
                     segment_path.stem,
                     environment,
+                    age_group,
                 )
 
 
@@ -135,6 +137,9 @@ class OutputWriter:
             "environment": self.file.create_dataset(
                 "environment", shape=(0,), maxshape=(None,), dtype=text_dtype, chunks=(1,), compression="gzip",
             ),
+            "age_group": self.file.create_dataset(
+                "age_group", shape=(0,), maxshape=(None,), dtype=text_dtype, chunks=(1,), compression="gzip",
+            ),
         }
         self.x_buffer: list[np.ndarray] = []
         self.y_buffer: list[np.ndarray] = []
@@ -142,10 +147,11 @@ class OutputWriter:
         self.subject_buffer: list[str] = []
         self.segment_buffer: list[str] = []
         self.environment_buffer: list[str] = []
+        self.age_group_buffer: list[str] = []
 
     def append(
         self, x: np.ndarray, y: np.ndarray, timestamp: np.ndarray,
-        subject: str, segment_id: str, environment: str,
+        subject: str, segment_id: str, environment: str, age_group: str,
     ) -> None:
         self.x_buffer.append(x.astype(np.float32, copy=False))
         self.y_buffer.append(y.astype(np.int32, copy=False))
@@ -153,6 +159,7 @@ class OutputWriter:
         self.subject_buffer.append(subject)
         self.segment_buffer.append(segment_id)
         self.environment_buffer.append(environment)
+        self.age_group_buffer.append(age_group)
         if len(self.x_buffer) >= self.flush_threshold:
             self.flush()
 
@@ -171,6 +178,7 @@ class OutputWriter:
             "std": np.mean(np.std(x, axis=2), axis=2).astype(np.float32),
             "segment_id": np.asarray(self.segment_buffer, dtype=h5py.string_dtype(encoding="utf-8")),
             "environment": np.asarray(self.environment_buffer, dtype=h5py.string_dtype(encoding="utf-8")),
+            "age_group": np.asarray(self.age_group_buffer, dtype=h5py.string_dtype(encoding="utf-8")),
         }
         for name, values in payloads.items():
             dataset = self.datasets[name]
@@ -182,6 +190,7 @@ class OutputWriter:
         self.subject_buffer.clear()
         self.segment_buffer.clear()
         self.environment_buffer.clear()
+        self.age_group_buffer.clear()
 
     def close(self) -> int:
         self.flush()
@@ -201,8 +210,8 @@ def write_split(
             if not subject_dir.is_dir():
                 LOGGER.warning("Subject directory not found: %s", subject_dir)
                 continue
-            for x, timestamps, y, segment_id, environment in iter_segment_windows(subject_dir, subject, window_size):
-                writer.append(x, y, timestamps, subject, segment_id, environment)
+            for x, timestamps, y, segment_id, environment, age_group in iter_segment_windows(subject_dir, subject, window_size):
+                writer.append(x, y, timestamps, subject, segment_id, environment, age_group)
         return writer.close()
     except Exception:
         writer.close()
@@ -217,14 +226,18 @@ def read_split_csv(split_csv: Path) -> dict[str, list[str]]:
     if missing:
         raise ValueError(f"{split_csv} is missing columns: {sorted(missing)}")
     splits: dict[str, list[str]] = {}
+    assignment_by_subject: dict[str, str] = {}
+    for row in frame.loc[:, [subject_column, "split"]].dropna().itertuples(index=False):
+        subject, split_name = str(row[0]), str(row[1])
+        if split_name not in {"train", "validation", "test"}:
+            raise ValueError(f"Unsupported split {split_name!r} for subject {subject} in {split_csv}")
+        previous = assignment_by_subject.setdefault(subject, split_name)
+        if previous != split_name:
+            raise ValueError(f"Subject {subject} occurs in both {previous} and {split_name} in {split_csv}")
     for split_name in ("train", "validation", "test"):
-        subjects = frame.loc[frame["split"] == split_name, subject_column].dropna().astype(str).tolist()
-        if len(subjects) != len(set(subjects)):
-            raise ValueError(f"Duplicate subject IDs in {split_name} rows of {split_csv}")
-        splits[split_name] = subjects
-    assigned = set().union(*[set(subjects) for subjects in splits.values()])
-    if len(assigned) != sum(len(subjects) for subjects in splits.values()):
-        raise ValueError(f"A subject occurs in more than one final split in {split_csv}")
+        splits[split_name] = sorted(
+            subject for subject, assignment in assignment_by_subject.items() if assignment == split_name
+        )
     return splits
 
 

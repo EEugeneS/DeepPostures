@@ -20,7 +20,10 @@ python create_subject_split.py \\
 ```
 
 The fixed output CSV has `subject`, `age_group`, `split`, `source_split`, and
-`seed` columns. Use the same file for every CHAP experiment.
+`seed` columns. A subject can appear on multiple rows when recordings span an
+age-group boundary, but all of that subject's rows receive the same final
+split. This prevents subject leakage while balancing train/validation coverage
+across age groups. Use the same file for every CHAP experiment.
 
 ## 2. Preprocess wrist recordings
 
@@ -52,4 +55,5 @@ python create_dataset_split.py \\
 This produces `10s_train.h5`, `10s_val.h5`, and `10s_test_complete.h5` with
 the same core arrays as CHAP2. Windows are made separately within each segment
 H5, and never cross a recording-file boundary. Extra `segment_id` and
-`environment` datasets preserve the source context for later analysis.
+`environment`/`age_group` datasets preserve the source context for later
+analysis.
