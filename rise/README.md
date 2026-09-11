@@ -12,8 +12,10 @@ randomization into the `subject_id,split` manifest consumed by
 `CHAP2/create_dataset_split.py`.
 
 It keeps every `test_set` participant as `test` and divides only `train_set`
-participants into `train` and `validation`.  All files and visits belonging to
-one subject must remain in the same final split.
+participants into `train` and `validation`. All files and visits belonging to
+one subject remain in the same final split. With the BL/FV raw directories,
+validation selection is stratified by `BL-only`, `FV-only`, and `BL+FV`
+availability, so both visits remain represented in train and validation.
 
 For the current P2 list (311 `train_set`, 95 `test_set`), the default 25%
 validation split yields approximately 233 train, 78 validation, and 95 test
@@ -22,6 +24,8 @@ subjects.
 ```bash
 python rise/create_subject_split.py \
   --source-csv /path/to/P2_train_test_rand.csv \
+  --bl-raw-dir /path/to/AG/BL \
+  --fv-raw-dir /path/to/AG/FV \
   --output-csv /path/to/rise_subject_split.csv \
   --validation-fraction 0.25 \
   --seed 42
