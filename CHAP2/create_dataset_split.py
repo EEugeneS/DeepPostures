@@ -173,7 +173,12 @@ if __name__ == "__main__":
         assert args.data_dir and args.split_csv and args.output_dir, \
             "Full run requires --data_dir, --split_csv, --output_dir"
 
-        split_df = pd.read_csv(args.split_csv)
+        # Subject IDs can be numeric-only (e.g. Rise participant IDs).  Read
+        # them explicitly as strings because they are later used as directory
+        # names under ``data_dir``.
+        split_df = pd.read_csv(args.split_csv, dtype={'subject_id': str, 'split': str})
+        split_df['subject_id'] = split_df['subject_id'].str.strip()
+        split_df['split'] = split_df['split'].str.strip()
         train_subjects = split_df[split_df['split'] == 'train']['subject_id'].tolist()
         val_subjects = split_df[split_df['split'] == 'validation']['subject_id'].tolist()
         test_subjects = split_df[split_df['split'] == 'test']['subject_id'].tolist()
