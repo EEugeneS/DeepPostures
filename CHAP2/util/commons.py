@@ -107,15 +107,24 @@ def input_iterator(data_root, subject_id, train=False):
         if not name.startswith(".")
     ]
     fnames.sort()
-    for i in range(len(fnames) - 1):
-        assert datetime.strptime(fnames[i + 1], "%Y-%m-%d").date() - datetime.strptime(
-            fnames[i], "%Y-%m-%d"
-        ).date() == timedelta(days=1)
 
     data_batch = []
     timestamps_batch = []
     label_batch = []
+    previous_date = None
     for fname in fnames:
+        current_date = datetime.strptime(fname, "%Y-%m-%d").date()
+
+        # A subject can have multiple, temporally separated visits (e.g. Rise
+        # BL and FV).  Do not construct a window across such a gap: finish the
+        # current contiguous sequence and start a new one at this date.
+        if previous_date is not None and current_date - previous_date != timedelta(days=1):
+            if len(timestamps_batch) > 0:
+                yield np.array(data_batch), np.array(timestamps_batch), np.array(label_batch)
+            data_batch = []
+            timestamps_batch = []
+            label_batch = []
+
         h5f = h5py.File(os.path.join(data_root, subject_id, "{}.h5".format(fname)), "r")
         timestamps = h5f.get("time")[:]
         data = h5f.get("data")[:]
@@ -142,6 +151,7 @@ def input_iterator(data_root, subject_id, train=False):
             label_batch.append(l)
 
         h5f.close()
+        previous_date = current_date
 
     if len(timestamps_batch) > 0:
         yield np.array(data_batch), np.array(timestamps_batch), np.array(label_batch)
