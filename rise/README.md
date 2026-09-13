@@ -47,15 +47,16 @@ creates its `X_*.pt` and `y_*.pt` inputs. `create_moca_dataset.py` fills that
 gap without using CHAP's downsampled HDF5 files. It preserves the 30 Hz raw
 signal and creates non-overlapping 10-second windows of shape `(1, 300, 3)`.
 
+For Rise, provide both BL and FV in one invocation. This prevents the second
+visit from overwriting tensors created for the first visit:
+
 ```bash
 python rise/MoCA/create_moca_dataset.py \
-  --gt3x-dir /path/to/AG_30Hz \
-  --activpal-dir /path/to/AP_10s \
   --split-csv /path/to/rise_subject_split.csv \
-  --valid-days-file /path/to/Valid_day.csv \
-  --sleep-logs-file /path/to/sleepLog.csv \
-  --non-wear-times-file /path/to/NonWear.csv \
-  --output-dir /path/to/rise_moca_30hz
+  --output-dir /path/to/rise_moca_30hz \
+  --expression-after-id BL FV \
+  --visit BL /path/to/AG/BL /path/to/AP_10s/BL /path/to/P2_BL_valid_day.csv /path/to/P2_BL_sleepLog.csv /path/to/P2_BL_NonWear.csv \
+  --visit FV /path/to/AG/FV /path/to/AP_10s/FV /path/to/P2_FV_valid_day.csv /path/to/P2_FV_sleepLog.csv /path/to/P2_FV_NonWear.csv
 ```
 
 It writes `X_train.pt`, `X_validation.pt`, `X_test.pt`, their corresponding

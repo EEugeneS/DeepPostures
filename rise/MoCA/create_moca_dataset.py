@@ -305,13 +305,23 @@ def iter_windows(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Create MoCA-ready Rise tensors from raw ActiGraph data.")
-    parser.add_argument("--gt3x-dir", required=True, help="Flat directory containing Rise 30 Hz raw CSV/CSV.GZ files.")
-    parser.add_argument("--activpal-dir", required=True, help="Directory containing matching Rise AP Event CSV files.")
+    parser.add_argument("--gt3x-dir", help="Legacy single-visit raw CSV/CSV.GZ directory.")
+    parser.add_argument("--activpal-dir", help="Legacy single-visit matching Rise AP Event CSV directory.")
     parser.add_argument("--split-csv", required=True, help="subject_id,split manifest created by create_subject_split.py.")
     parser.add_argument("--output-dir", required=True, help="Directory for X_*.pt and y_*.pt tensors.")
     parser.add_argument("--valid-days-file", default=None)
     parser.add_argument("--sleep-logs-file", default=None)
     parser.add_argument("--non-wear-times-file", default=None)
+    parser.add_argument(
+        "--visit",
+        action="append",
+        nargs=6,
+        metavar=("NAME", "GT3X_DIR", "ACTIVPAL_DIR", "VALID_DAYS_CSV", "SLEEP_LOG_CSV", "NON_WEAR_CSV"),
+        help=(
+            "One Rise visit source. Repeat for BL and FV. When used, provide "
+            "NAME, raw directory, Event directory, valid-day CSV, sleep-log CSV, and non-wear CSV."
+        ),
+    )
     parser.add_argument("--gt3x-frequency", type=int, default=30)
     parser.add_argument("--window-seconds", type=int, default=10)
     parser.add_argument("--label-frequency", type=int, default=10,
@@ -327,6 +337,44 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def visit_sources(args: argparse.Namespace) -> List[Tuple[str, Path, Path, Optional[Path], Optional[Path], Optional[Path]]]:
+    """Return one or more raw/Event/support-file groups to combine into one dataset."""
+    sources = []
+    if args.visit:
+        if any((args.gt3x_dir, args.activpal_dir, args.valid_days_file,
+                args.sleep_logs_file, args.non_wear_times_file)):
+            raise ValueError("Use either repeated --visit sources or the legacy single-visit arguments, not both.")
+        for name, raw_dir, event_dir, valid_days, sleep_logs, non_wear in args.visit:
+            sources.append((
+                name,
+                Path(raw_dir),
+                Path(event_dir),
+                Path(valid_days),
+                Path(sleep_logs),
+                Path(non_wear),
+            ))
+    else:
+        if not args.gt3x_dir or not args.activpal_dir:
+            raise ValueError("Provide either --visit or both --gt3x-dir and --activpal-dir.")
+        sources.append((
+            "default",
+            Path(args.gt3x_dir),
+            Path(args.activpal_dir),
+            Path(args.valid_days_file) if args.valid_days_file else None,
+            Path(args.sleep_logs_file) if args.sleep_logs_file else None,
+            Path(args.non_wear_times_file) if args.non_wear_times_file else None,
+        ))
+
+    for name, raw_dir, event_dir, valid_days, sleep_logs, non_wear in sources:
+        for description, path in (("raw", raw_dir), ("Event", event_dir)):
+            if not path.is_dir():
+                raise NotADirectoryError(f"{name} {description} directory does not exist: {path}")
+        for description, path in (("valid-day", valid_days), ("sleep-log", sleep_logs), ("non-wear", non_wear)):
+            if path is not None and not path.is_file():
+                raise FileNotFoundError(f"{name} {description} CSV does not exist: {path}")
+    return sources
+
+
 def main() -> None:
     args = parse_args()
     if args.gt3x_frequency <= 0 or args.window_seconds <= 0 or args.label_frequency <= 0:
@@ -336,26 +384,24 @@ def main() -> None:
     if args.n_start_id is not None and (args.n_start_id <= 0 or args.n_start_id > args.n_end_id):
         raise ValueError("Invalid ID slice boundaries.")
 
-    raw_dir = Path(args.gt3x_dir)
-    event_dir = Path(args.activpal_dir)
     split_path = Path(args.split_csv)
-    for required_path in (raw_dir, event_dir, split_path):
-        if not required_path.exists():
-            raise FileNotFoundError(required_path)
+    if not split_path.is_file():
+        raise FileNotFoundError(split_path)
+    sources = visit_sources(args)
     label_map = {str(key): int(value) for key, value in json.loads(args.activpal_label_map).items()}
     assignments = read_split_manifest(split_path)
-    valid_days = read_valid_days(Path(args.valid_days_file)) if args.valid_days_file else {}
-    sleep_logs = read_sleep_logs(Path(args.sleep_logs_file)) if args.sleep_logs_file else {}
-    non_wear = read_non_wear(Path(args.non_wear_times_file)) if args.non_wear_times_file else {}
-
     # Pass 1 counts valid windows so large studies need not reside in RAM.
     count_counters: Counter = Counter()
     counts: Counter = Counter()
-    for split, _, _, _, _, _ in iter_windows(
-        raw_dir, event_dir, assignments, valid_days, sleep_logs, non_wear,
-        label_map, args, include_signals=False, counters=count_counters,
-    ):
-        counts[split] += 1
+    for _, raw_dir, event_dir, valid_days_path, sleep_logs_path, non_wear_path in sources:
+        valid_days = read_valid_days(valid_days_path)
+        sleep_logs = read_sleep_logs(sleep_logs_path)
+        non_wear = read_non_wear(non_wear_path)
+        for split, _, _, _, _, _ in iter_windows(
+            raw_dir, event_dir, assignments, valid_days, sleep_logs, non_wear,
+            label_map, args, include_signals=False, counters=count_counters,
+        ):
+            counts[split] += 1
     if not sum(counts.values()):
         raise RuntimeError("No valid windows were produced; check file names, timestamps, and filters.")
 
@@ -376,14 +422,18 @@ def main() -> None:
     positions: Counter = Counter()
     x_arrays = {split: np.load(paths[0], mmap_mode="r+") for split, paths in staging.items()}
     y_arrays = {split: np.load(paths[1], mmap_mode="r+") for split, paths in staging.items()}
-    for split, signals, label, _, _, _ in iter_windows(
-        raw_dir, event_dir, assignments, valid_days, sleep_logs, non_wear,
-        label_map, args, include_signals=True, counters=fill_counters,
-    ):
-        index = positions[split]
-        x_arrays[split][index, 0] = signals
-        y_arrays[split][index] = label
-        positions[split] += 1
+    for _, raw_dir, event_dir, valid_days_path, sleep_logs_path, non_wear_path in sources:
+        valid_days = read_valid_days(valid_days_path)
+        sleep_logs = read_sleep_logs(sleep_logs_path)
+        non_wear = read_non_wear(non_wear_path)
+        for split, signals, label, _, _, _ in iter_windows(
+            raw_dir, event_dir, assignments, valid_days, sleep_logs, non_wear,
+            label_map, args, include_signals=True, counters=fill_counters,
+        ):
+            index = positions[split]
+            x_arrays[split][index, 0] = signals
+            y_arrays[split][index] = label
+            positions[split] += 1
     if counts != positions:
         raise RuntimeError(f"Window counts changed between passes: expected {dict(counts)}, got {dict(positions)}")
 
@@ -399,6 +449,10 @@ def main() -> None:
         "window_seconds": args.window_seconds,
         "label_frequency": args.label_frequency,
         "label_map": label_map,
+        "visit_sources": [
+            {"name": name, "raw_dir": str(raw_dir), "activpal_dir": str(event_dir)}
+            for name, raw_dir, event_dir, _, _, _ in sources
+        ],
         "window_counts": dict(counts),
         "first_pass_dropped_windows": dict(count_counters),
     }
