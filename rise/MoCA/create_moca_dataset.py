@@ -11,6 +11,7 @@ import argparse
 import csv
 import gzip
 import json
+import multiprocessing
 import os
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta
@@ -223,6 +224,86 @@ def raw_files(raw_dir: Path) -> List[Path]:
     )
 
 
+def iter_file_windows(
+    raw_path: Path,
+    event_dir: Path,
+    assignments: Dict[str, str],
+    valid_days: Dict[str, set],
+    sleep_logs: Dict[str, List[Tuple[datetime, datetime]]],
+    non_wear: Dict[str, List[Tuple[datetime, datetime]]],
+    label_map: Dict[str, int],
+    args: argparse.Namespace,
+    include_signals: bool,
+    counters: Counter,
+) -> Iterator[Tuple[str, Optional[np.ndarray], int, float, str, str]]:
+    """Yield valid windows from one raw ActiGraph file."""
+    samples_per_window = args.gt3x_frequency * args.window_seconds
+    if args.gt3x_frequency % args.label_frequency != 0:
+        raise ValueError("gt3x-frequency must be divisible by label-frequency.")
+
+    stem = source_stem(raw_path)
+    subject_id = subject_id_from_stem(stem, args)
+    if subject_id not in assignments:
+        counters["raw_files_without_split_subject"] += 1
+        return
+    event_path = event_dir / f"{stem}.csv"
+    if not event_path.is_file():
+        raise FileNotFoundError(f"Missing matching Event file for {raw_path}: {event_path}")
+
+    opener = gzip.open if raw_path.name.endswith(".gz") else open
+    with opener(raw_path, mode="rt") as input_file:
+        current_time = parse_raw_start(input_file)
+        events = EventLookup(event_path, label_map)
+        while True:
+            raw_lines = [input_file.readline().rstrip() for _ in range(samples_per_window)]
+            if any(line == "" for line in raw_lines):
+                break
+
+            tick_labels: List[int] = []
+            tick_non_wear: List[int] = []
+            tick_sleep: List[int] = []
+            for tick in range(args.window_seconds * args.label_frequency):
+                tick_time = current_time + timedelta(seconds=tick / args.label_frequency)
+                tick_labels.append(events.label_at(tick_time))
+                valid_day_missing = bool(valid_days) and (
+                    subject_id in valid_days and tick_time.date() not in valid_days[subject_id]
+                )
+                tick_non_wear.append(int(
+                    valid_day_missing or in_intervals(tick_time, non_wear.get(subject_id, []))
+                ))
+                tick_sleep.append(int(in_intervals(tick_time, sleep_logs.get(subject_id, []))))
+
+            label = mode(tick_labels)
+            non_wear_label = mode(tick_non_wear)
+            sleep_label = mode(tick_sleep)
+            window_end = current_time + timedelta(seconds=args.window_seconds)
+
+            if label == -1:
+                counters["dropped_unlabelled"] += 1
+            elif non_wear_label:
+                counters["dropped_non_wear_or_invalid_day"] += 1
+            elif sleep_label:
+                counters["dropped_sleep"] += 1
+            else:
+                signals = None
+                if include_signals:
+                    try:
+                        signals = np.asarray(
+                            [[float(value) for value in line.split(",")] for line in raw_lines],
+                            dtype=np.float32,
+                        )
+                    except ValueError as exc:
+                        raise ValueError(f"Invalid acceleration row in {raw_path} at {current_time}.") from exc
+                    if signals.shape != (samples_per_window, 3):
+                        raise ValueError(
+                            f"Expected {samples_per_window} rows of xyz acceleration in {raw_path}; "
+                            f"got shape {signals.shape}."
+                        )
+                yield assignments[subject_id], signals, label, current_time.timestamp(), subject_id, stem
+
+            current_time = window_end
+
+
 def iter_windows(
     raw_dir: Path,
     event_dir: Path,
@@ -235,72 +316,117 @@ def iter_windows(
     include_signals: bool,
     counters: Counter,
 ) -> Iterator[Tuple[str, Optional[np.ndarray], int, float, str, str]]:
-    samples_per_window = args.gt3x_frequency * args.window_seconds
-    if args.gt3x_frequency % args.label_frequency != 0:
-        raise ValueError("gt3x-frequency must be divisible by label-frequency.")
-
+    """Yield valid windows from every file in a single visit source."""
     for raw_path in raw_files(raw_dir):
-        stem = source_stem(raw_path)
-        subject_id = subject_id_from_stem(stem, args)
-        if subject_id not in assignments:
-            counters["raw_files_without_split_subject"] += 1
-            continue
-        event_path = event_dir / f"{stem}.csv"
-        if not event_path.is_file():
-            raise FileNotFoundError(f"Missing matching Event file for {raw_path}: {event_path}")
+        yield from iter_file_windows(
+            raw_path, event_dir, assignments, valid_days, sleep_logs, non_wear,
+            label_map, args, include_signals, counters,
+        )
 
-        opener = gzip.open if raw_path.name.endswith(".gz") else open
-        with opener(raw_path, mode="rt") as input_file:
-            current_time = parse_raw_start(input_file)
-            events = EventLookup(event_path, label_map)
-            while True:
-                raw_lines = [input_file.readline().rstrip() for _ in range(samples_per_window)]
-                if any(line == "" for line in raw_lines):
-                    break
 
-                tick_labels: List[int] = []
-                tick_non_wear: List[int] = []
-                tick_sleep: List[int] = []
-                for tick in range(args.window_seconds * args.label_frequency):
-                    tick_time = current_time + timedelta(seconds=tick / args.label_frequency)
-                    tick_labels.append(events.label_at(tick_time))
-                    valid_day_missing = bool(valid_days) and (
-                        subject_id in valid_days and tick_time.date() not in valid_days[subject_id]
-                    )
-                    tick_non_wear.append(int(
-                        valid_day_missing or in_intervals(tick_time, non_wear.get(subject_id, []))
-                    ))
-                    tick_sleep.append(int(in_intervals(tick_time, sleep_logs.get(subject_id, []))))
+# Worker state is initialized once per process.  Raw files are independent, so
+# workers can count or write separate files without sharing Python objects.
+_WORKER_STATE: Dict[str, object] = {}
 
-                label = mode(tick_labels)
-                non_wear_label = mode(tick_non_wear)
-                sleep_label = mode(tick_sleep)
-                window_end = current_time + timedelta(seconds=args.window_seconds)
 
-                if label == -1:
-                    counters["dropped_unlabelled"] += 1
-                elif non_wear_label:
-                    counters["dropped_non_wear_or_invalid_day"] += 1
-                elif sleep_label:
-                    counters["dropped_sleep"] += 1
-                else:
-                    signals = None
-                    if include_signals:
-                        try:
-                            signals = np.asarray(
-                                [[float(value) for value in line.split(",")] for line in raw_lines],
-                                dtype=np.float32,
-                            )
-                        except ValueError as exc:
-                            raise ValueError(f"Invalid acceleration row in {raw_path} at {current_time}.") from exc
-                        if signals.shape != (samples_per_window, 3):
-                            raise ValueError(
-                                f"Expected {samples_per_window} rows of xyz acceleration in {raw_path}; "
-                                f"got shape {signals.shape}."
-                            )
-                    yield assignments[subject_id], signals, label, current_time.timestamp(), subject_id, stem
+def initialise_worker(
+    args: argparse.Namespace,
+    assignments: Dict[str, str],
+    label_map: Dict[str, int],
+    sources: List[Dict[str, object]],
+    staging_paths: Optional[Dict[str, Tuple[str, str]]] = None,
+) -> None:
+    global _WORKER_STATE
+    _WORKER_STATE = {
+        "args": args,
+        "assignments": assignments,
+        "label_map": label_map,
+        "sources": sources,
+        "staging_paths": staging_paths,
+    }
 
-                current_time = window_end
+
+def worker_windows(source_index: int, raw_path_string: str, include_signals: bool, counters: Counter):
+    source = _WORKER_STATE["sources"][source_index]
+    return iter_file_windows(
+        Path(raw_path_string),
+        source["event_dir"],
+        _WORKER_STATE["assignments"],
+        source["valid_days"],
+        source["sleep_logs"],
+        source["non_wear"],
+        _WORKER_STATE["label_map"],
+        _WORKER_STATE["args"],
+        include_signals,
+        counters,
+    )
+
+
+def count_raw_task(task: Tuple[int, int, str]) -> Tuple[int, Dict[str, int], Dict[str, int]]:
+    task_index, source_index, raw_path_string = task
+    counts: Counter = Counter()
+    dropped: Counter = Counter()
+    for split, _, _, _, _, _ in worker_windows(source_index, raw_path_string, False, dropped):
+        counts[split] += 1
+    return task_index, dict(counts), dict(dropped)
+
+
+def write_raw_task(
+    task: Tuple[int, int, str, Dict[str, int]]
+) -> Tuple[int, Dict[str, int]]:
+    task_index, source_index, raw_path_string, offsets = task
+    staging_paths = _WORKER_STATE["staging_paths"]
+    arrays = _WORKER_STATE.get("x_arrays")
+    labels = _WORKER_STATE.get("y_arrays")
+    if arrays is None or labels is None:
+        arrays = {
+            split: np.load(x_path, mmap_mode="r+")
+            for split, (x_path, _) in staging_paths.items()
+        }
+        labels = {
+            split: np.load(y_path, mmap_mode="r+")
+            for split, (_, y_path) in staging_paths.items()
+        }
+        _WORKER_STATE["x_arrays"] = arrays
+        _WORKER_STATE["y_arrays"] = labels
+    written: Counter = Counter()
+    try:
+        ignored: Counter = Counter()
+        for split, signals, label, _, _, _ in worker_windows(source_index, raw_path_string, True, ignored):
+            index = offsets[split] + written[split]
+            arrays[split][index, 0] = signals
+            labels[split][index] = label
+            written[split] += 1
+        return task_index, dict(written)
+    finally:
+        for array in arrays.values():
+            array.flush()
+        for array in labels.values():
+            array.flush()
+
+
+def run_parallel(
+    worker_function,
+    tasks: Sequence[tuple],
+    args: argparse.Namespace,
+    assignments: Dict[str, str],
+    label_map: Dict[str, int],
+    sources: List[Dict[str, object]],
+    staging_paths: Optional[Dict[str, Tuple[str, str]]] = None,
+) -> Iterator[tuple]:
+    initargs = (args, assignments, label_map, sources, staging_paths)
+    if args.mp == 1:
+        initialise_worker(*initargs)
+        for task in tasks:
+            yield worker_function(task)
+        return
+
+    with multiprocessing.Pool(
+        processes=args.mp,
+        initializer=initialise_worker,
+        initargs=initargs,
+    ) as pool:
+        yield from pool.imap_unordered(worker_function, tasks, chunksize=1)
 
 
 def parse_args() -> argparse.Namespace:
@@ -332,6 +458,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--n-end-id", type=int, default=None)
     parser.add_argument("--expression-after-id", nargs="*", default=None,
                         help="Split raw filename stem at this separator to obtain a subject ID.")
+    parser.add_argument("--mp", type=int, default=1,
+                        help="Number of raw-file preprocessing workers (default: 1).")
     parser.add_argument("--keep-temporary-arrays", action="store_true",
                         help="Keep memory-mapped .npy staging arrays after writing tensors.")
     return parser.parse_args()
@@ -379,6 +507,8 @@ def main() -> None:
     args = parse_args()
     if args.gt3x_frequency <= 0 or args.window_seconds <= 0 or args.label_frequency <= 0:
         raise ValueError("Frequencies and window-seconds must be positive.")
+    if args.mp <= 0:
+        raise ValueError("--mp must be positive.")
     if (args.n_start_id is None) != (args.n_end_id is None):
         raise ValueError("--n-start-id and --n-end-id must be provided together.")
     if args.n_start_id is not None and (args.n_start_id <= 0 or args.n_start_id > args.n_end_id):
@@ -390,18 +520,35 @@ def main() -> None:
     sources = visit_sources(args)
     label_map = {str(key): int(value) for key, value in json.loads(args.activpal_label_map).items()}
     assignments = read_split_manifest(split_path)
+
+    worker_sources: List[Dict[str, object]] = []
+    tasks: List[Tuple[int, int, str]] = []
+    for source_index, (name, raw_dir, event_dir, valid_days_path, sleep_logs_path, non_wear_path) in enumerate(sources):
+        worker_sources.append({
+            "name": name,
+            "event_dir": event_dir,
+            "valid_days": read_valid_days(valid_days_path),
+            "sleep_logs": read_sleep_logs(sleep_logs_path),
+            "non_wear": read_non_wear(non_wear_path),
+        })
+        for raw_path in raw_files(raw_dir):
+            tasks.append((len(tasks), source_index, str(raw_path)))
+    if not tasks:
+        raise RuntimeError("No raw CSV/CSV.GZ files were found in the supplied visit sources.")
+    print(f"Processing {len(tasks)} raw files with {args.mp} worker(s).")
+
     # Pass 1 counts valid windows so large studies need not reside in RAM.
     count_counters: Counter = Counter()
     counts: Counter = Counter()
-    for _, raw_dir, event_dir, valid_days_path, sleep_logs_path, non_wear_path in sources:
-        valid_days = read_valid_days(valid_days_path)
-        sleep_logs = read_sleep_logs(sleep_logs_path)
-        non_wear = read_non_wear(non_wear_path)
-        for split, _, _, _, _, _ in iter_windows(
-            raw_dir, event_dir, assignments, valid_days, sleep_logs, non_wear,
-            label_map, args, include_signals=False, counters=count_counters,
-        ):
-            counts[split] += 1
+    task_counts: Dict[int, Counter] = {}
+    for task_index, task_count, task_dropped in run_parallel(
+        count_raw_task, tasks, args, assignments, label_map, worker_sources,
+    ):
+        task_counts[task_index] = Counter(task_count)
+        counts.update(task_count)
+        count_counters.update(task_dropped)
+    if len(task_counts) != len(tasks):
+        raise RuntimeError("The first pass did not return a count for every raw file.")
     if not sum(counts.values()):
         raise RuntimeError("No valid windows were produced; check file names, timestamps, and filters.")
 
@@ -417,31 +564,35 @@ def main() -> None:
         np.lib.format.open_memmap(y_path, mode="w+", dtype=np.int64, shape=(counts[split],))
         staging[split] = (x_path, y_path)
 
-    # Pass 2 writes raw 30 Hz signal windows into the preallocated arrays.
-    fill_counters: Counter = Counter()
-    positions: Counter = Counter()
-    x_arrays = {split: np.load(paths[0], mmap_mode="r+") for split, paths in staging.items()}
-    y_arrays = {split: np.load(paths[1], mmap_mode="r+") for split, paths in staging.items()}
-    for _, raw_dir, event_dir, valid_days_path, sleep_logs_path, non_wear_path in sources:
-        valid_days = read_valid_days(valid_days_path)
-        sleep_logs = read_sleep_logs(sleep_logs_path)
-        non_wear = read_non_wear(non_wear_path)
-        for split, signals, label, _, _, _ in iter_windows(
-            raw_dir, event_dir, assignments, valid_days, sleep_logs, non_wear,
-            label_map, args, include_signals=True, counters=fill_counters,
-        ):
-            index = positions[split]
-            x_arrays[split][index, 0] = signals
-            y_arrays[split][index] = label
-            positions[split] += 1
-    if counts != positions:
-        raise RuntimeError(f"Window counts changed between passes: expected {dict(counts)}, got {dict(positions)}")
+    # Pass 2 writes each raw file to a preassigned, non-overlapping memmap range.
+    # This permits parallel writes without copying raw signals through the parent process.
+    running_offsets: Counter = Counter()
+    write_tasks = []
+    for task_index, source_index, raw_path_string in tasks:
+        offsets = {split: running_offsets[split] for split in ("train", "validation", "test")}
+        write_tasks.append((task_index, source_index, raw_path_string, offsets))
+        running_offsets.update(task_counts[task_index])
+
+    positions: Dict[int, Counter] = {}
+    staging_paths = {split: (str(x_path), str(y_path)) for split, (x_path, y_path) in staging.items()}
+    for task_index, task_positions in run_parallel(
+        write_raw_task, write_tasks, args, assignments, label_map, worker_sources, staging_paths,
+    ):
+        positions[task_index] = Counter(task_positions)
+    if len(positions) != len(tasks):
+        raise RuntimeError("The second pass did not return a write count for every raw file.")
+    for task_index, expected in task_counts.items():
+        actual = positions[task_index]
+        if expected != actual:
+            raise RuntimeError(
+                f"Window counts changed for raw task {task_index}: expected {dict(expected)}, got {dict(actual)}"
+            )
 
     for split in ("train", "validation", "test"):
-        x_arrays[split].flush()
-        y_arrays[split].flush()
-        torch.save(torch.from_numpy(x_arrays[split]), output_dir / f"X_{split}.pt")
-        torch.save(torch.from_numpy(y_arrays[split]), output_dir / f"y_{split}.pt")
+        x_array = np.load(staging[split][0], mmap_mode="r")
+        y_array = np.load(staging[split][1], mmap_mode="r")
+        torch.save(torch.from_numpy(x_array), output_dir / f"X_{split}.pt")
+        torch.save(torch.from_numpy(y_array), output_dir / f"y_{split}.pt")
 
     metadata = {
         "input_shape": [1, samples_per_window, 3],

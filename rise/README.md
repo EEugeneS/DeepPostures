@@ -55,6 +55,7 @@ python rise/MoCA/create_moca_dataset.py \
   --split-csv /path/to/rise_subject_split.csv \
   --output-dir /path/to/rise_moca_30hz \
   --expression-after-id BL FV \
+  --mp 20 \
   --visit BL /path/to/AG/BL /path/to/AP_10s/BL /path/to/P2_BL_valid_day.csv /path/to/P2_BL_sleepLog.csv /path/to/P2_BL_NonWear.csv \
   --visit FV /path/to/AG/FV /path/to/AP_10s/FV /path/to/P2_FV_valid_day.csv /path/to/P2_FV_sleepLog.csv /path/to/P2_FV_NonWear.csv
 ```
