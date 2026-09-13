@@ -1,5 +1,10 @@
 # Rise experiment utilities
 
+Training and prediction: see [TRAINING.md](TRAINING.md). The unified
+`run.py` supports CHAP ZS/FT/LP/scratch and MoCA LP/FT/scratch using explicit
+train/validation/test datasets. MoCA's downstream encoder is included with
+its original license under `MoCA/vendor/`.
+
 ```text
 rise/
 ├── create_subject_split.py       # shared subject-level train/validation/test manifest

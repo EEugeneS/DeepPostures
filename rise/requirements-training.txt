@@ -1,0 +1,6 @@
+torch>=2.2,<3
+torchvision>=0.17
+timm==0.9.16
+numpy
+h5py
+einops
