@@ -1,0 +1,74 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: moca-wrist-preprocess
+  labels:
+    app: deep-postures
+    dataset: moca-wrist
+    stage: preprocess
+spec:
+  completionMode: Indexed
+  completions: 6
+  parallelism: 6
+  backoffLimit: 6
+  ttlSecondsAfterFinished: 86400
+  template:
+    metadata:
+      labels:
+        app: deep-postures
+        dataset: moca-wrist
+        stage: preprocess
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 120
+      containers:
+        - name: preprocessor
+          image: ghcr.io/eeugenes/deep-postures-rise@sha256:b143797b215b5c87baab307db8b6d3fd721a4cb47e1197be7c7337dc7464730c
+          imagePullPolicy: Always
+          command: [bash, -lc]
+          args:
+            - |
+              age_groups=(1.5to5.9 6to9.9 10to12.9 13to14.9 15to17.9 18to20)
+              age_group="${age_groups[${JOB_COMPLETION_INDEX}]}"
+              exec python /opt/deep-postures/moca_wrist/pre_process_data.py \
+                --data-root /niddk-data-central/MOCA \
+                --age-group "${age_group}" \
+                --output-dir /niddk-data-central/yuchen_workspace/moca_wrist_outputs/processed_wrist \
+                --manifest-csv "/niddk-data-central/yuchen_workspace/moca_wrist_outputs/manifests/${age_group}.csv" \
+                --overwrite
+          env:
+            - name: JOB_COMPLETION_INDEX
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.annotations['batch.kubernetes.io/job-completion-index']
+            - name: HOME
+              value: /scratch/home
+            - name: XDG_CACHE_HOME
+              value: /scratch/cache
+            - name: TMPDIR
+              value: /scratch/tmp
+            - name: OMP_NUM_THREADS
+              value: "1"
+            - name: MKL_NUM_THREADS
+              value: "1"
+          resources:
+            requests:
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 4Gi
+            limits:
+              cpu: "2"
+              memory: 8Gi
+              ephemeral-storage: 4Gi
+          volumeMounts:
+            - name: niddk-data-central
+              mountPath: /niddk-data-central
+            - name: scratch
+              mountPath: /scratch
+      volumes:
+        - name: niddk-data-central
+          persistentVolumeClaim:
+            claimName: niddk-data-central
+        - name: scratch
+          emptyDir:
+            sizeLimit: 4Gi
